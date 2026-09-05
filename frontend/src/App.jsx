@@ -99,6 +99,11 @@ const initialStudentLoans = [
 const fmt = (n) => `$${n.toFixed(2)}`;
 const monthly = (sub) => (sub.cycle === "yearly" ? sub.amount / 12 : sub.amount);
 const STORAGE_KEY = "rocket-clone-state-v1";
+const API_BASE = "http://localhost:8080/api/plaid";
+const USER_ID = "demo-user";
+
+const fmtTxnDate = (iso) =>
+  new Date(iso + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" });
 
 export default function RocketMoneyClone() {
   const [subscriptions, setSubscriptions] = useState(initialSubscriptions);
@@ -107,7 +112,67 @@ export default function RocketMoneyClone() {
   const [view, setView] = useState("overview");
   const [subFilter, setSubFilter] = useState("active");
   const [confirmId, setConfirmId] = useState(null);
+  const [linkedItems, setLinkedItems] = useState([]);
+  const [plaidTxns, setPlaidTxns] = useState([]);
+  const [plaidLoans, setPlaidLoans] = useState([]);
   const loadedRef = useRef(false);
+
+  async function refreshPlaidData() {
+    try {
+      const [accountsRes, txnsRes, liabilitiesRes] = await Promise.all([
+        fetch(`${API_BASE}/accounts?userId=${USER_ID}`).then((r) => r.json()),
+        fetch(`${API_BASE}/transactions?userId=${USER_ID}`).then((r) => r.json()),
+        fetch(`${API_BASE}/liabilities?userId=${USER_ID}`).then((r) => r.json()),
+      ]);
+
+      const items = accountsRes.items || [];
+      setLinkedItems(items);
+
+      const balanceByAccountId = {};
+      items.forEach((item) =>
+        item.accounts.forEach((a) => (balanceByAccountId[a.account_id] = a.balances.current))
+      );
+
+      const txns = (txnsRes.items || [])
+        .flatMap((item) => item.transactions)
+        .sort((a, b) => (a.date < b.date ? 1 : -1));
+      setPlaidTxns(txns);
+
+      const loans = (liabilitiesRes.items || []).flatMap((item) =>
+        item.student.map((loan) => ({
+          id: loan.account_id,
+          loanName: loan.loan_name || "Student Loan",
+          servicer: item.institution_name,
+          principalBalance: balanceByAccountId[loan.account_id] ?? 0,
+          originalPrincipal: loan.origination_principal_amount || balanceByAccountId[loan.account_id] || 0,
+          interestRate: loan.interest_rate_percentage || 0,
+          minimumPayment: loan.minimum_payment_amount || 0,
+          nextPaymentDate: loan.next_payment_due_date ? fmtTxnDate(loan.next_payment_due_date) : "—",
+          status: loan.is_overdue ? "overdue" : "current",
+        }))
+      );
+      setPlaidLoans(loans);
+    } catch (e) {
+      // backend not reachable yet — leave sample data in place
+    }
+  }
+
+  useEffect(() => {
+    refreshPlaidData();
+  }, []);
+
+  async function disconnectItem(itemId) {
+    try {
+      await fetch(`${API_BASE}/remove_item`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: USER_ID, item_id: itemId }),
+      });
+      refreshPlaidData();
+    } catch (e) {
+      // best effort
+    }
+  }
 
   useEffect(() => {
     try {
@@ -171,12 +236,26 @@ export default function RocketMoneyClone() {
     subFilter === "all" ? true : s.status === subFilter
   );
 
-  const totalLoanBalance = studentLoans.reduce((sum, l) => sum + l.principalBalance, 0);
-  const totalLoanMinPayment = studentLoans.reduce((sum, l) => sum + l.minimumPayment, 0);
+  const displayedLoans = plaidLoans.length > 0 ? plaidLoans : studentLoans;
+  const totalLoanBalance = displayedLoans.reduce((sum, l) => sum + l.principalBalance, 0);
+  const totalLoanMinPayment = displayedLoans.reduce((sum, l) => sum + l.minimumPayment, 0);
   const weightedRate = totalLoanBalance
-    ? studentLoans.reduce((sum, l) => sum + l.interestRate * l.principalBalance, 0) / totalLoanBalance
+    ? displayedLoans.reduce((sum, l) => sum + l.interestRate * l.principalBalance, 0) / totalLoanBalance
     : 0;
-  const overdueLoanCount = studentLoans.filter((l) => l.status === "overdue").length;
+  const overdueLoanCount = displayedLoans.filter((l) => l.status === "overdue").length;
+
+  const displayedTxns =
+    plaidTxns.length > 0
+      ? plaidTxns.slice(0, 8).map((t) => ({
+          id: t.transaction_id,
+          merchant: t.merchant_name || t.name,
+          amount: Math.abs(t.amount),
+          date: fmtTxnDate(t.date),
+          sub: subscriptions.some(
+            (s) => s.name.toLowerCase() === (t.merchant_name || t.name || "").toLowerCase()
+          ),
+        }))
+      : transactions;
 
   const navItems = [
     { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -476,8 +555,33 @@ export default function RocketMoneyClone() {
             <p className="rm-hero-sub">Recurring spend across {activeSubs.length} subscriptions and bills</p>
 
             <div style={{ marginBottom: 28 }}>
-              <ConnectBank onLinked={(data) => console.log("Linked:", data)} />
+              <ConnectBank onLinked={() => refreshPlaidData()} />
             </div>
+
+            {linkedItems.length > 0 && (
+              <div style={{ marginBottom: 28 }}>
+                <h2 className="rm-section-title">Linked accounts</h2>
+                {linkedItems.map((item) => (
+                  <div key={item.item_id} style={{ marginBottom: 10 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <span style={{ fontSize: 12.5, color: "var(--muted)" }}>{item.institution_name}</span>
+                      <button className="rm-btn danger" onClick={() => disconnectItem(item.item_id)}>
+                        <X /> Disconnect
+                      </button>
+                    </div>
+                    {item.accounts.map((a) => (
+                      <div className="rm-txn-row" key={a.account_id}>
+                        <div className="rm-txn-left">
+                          <span>{a.name}</span>
+                          <span className="rm-txn-badge">{a.subtype}</span>
+                        </div>
+                        <span className="rm-txn-amount">{fmt(a.balances.current ?? 0)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
 
             {flaggedActive.length > 0 && (
               <div className="rm-callout">
@@ -509,7 +613,7 @@ export default function RocketMoneyClone() {
 
               <div>
                 <h2 className="rm-section-title">Recent activity</h2>
-                {transactions.map((t) => (
+                {displayedTxns.map((t) => (
                   <div className="rm-txn-row" key={t.id}>
                     <div className="rm-txn-left">
                       <span>{t.merchant}</span>
@@ -643,7 +747,7 @@ export default function RocketMoneyClone() {
               <span style={{ fontSize: 16, color: "var(--muted)" }}> owed</span>
             </p>
             <p className="rm-hero-sub">
-              {fmt(totalLoanMinPayment)}/mo minimum across {studentLoans.length} loans · {weightedRate.toFixed(2)}% avg. rate
+              {fmt(totalLoanMinPayment)}/mo minimum across {displayedLoans.length} loans · {weightedRate.toFixed(2)}% avg. rate
             </p>
 
             {overdueLoanCount > 0 && (
@@ -657,10 +761,10 @@ export default function RocketMoneyClone() {
               </div>
             )}
 
-            {studentLoans.map((loan) => {
-              const paidPct = Math.min(
-                ((loan.originalPrincipal - loan.principalBalance) / loan.originalPrincipal) * 100,
-                100
+            {displayedLoans.map((loan) => {
+              const paidPct = Math.max(
+                0,
+                Math.min(((loan.originalPrincipal - loan.principalBalance) / loan.originalPrincipal) * 100, 100)
               );
               return (
                 <div className="rm-sub-row" key={loan.id} style={{ flexWrap: "wrap" }}>
