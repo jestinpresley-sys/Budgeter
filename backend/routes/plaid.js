@@ -17,7 +17,10 @@ router.post("/create_link_token", async (req, res) => {
     const response = await plaidClient.linkTokenCreate({
       user: { client_user_id: userId },
       client_name: "Rocket Clone",
-      products: ["transactions", "liabilities"],
+      products: ["transactions"],
+      // Only initialized (and billed) when the chosen accounts support it, so
+      // banks with no loan/credit accounts don't fail with NO_LIABILITY_ACCOUNTS.
+      required_if_supported_products: ["liabilities"],
       country_codes: ["US"],
       language: "en",
       // webhook: "https://your-deployed-server.com/api/plaid/webhook",
@@ -133,15 +136,25 @@ router.get("/liabilities", async (req, res) => {
   try {
     const results = await Promise.all(
       items.map(async (item) => {
-        const response = await plaidClient.liabilitiesGet({
-          access_token: item.accessToken,
-        });
-        return {
-          institution_name: item.institutionName,
-          student: response.data.liabilities.student || [],
-          credit: response.data.liabilities.credit || [],
-          mortgage: response.data.liabilities.mortgage || [],
-        };
+        try {
+          const response = await plaidClient.liabilitiesGet({
+            access_token: item.accessToken,
+          });
+          return {
+            institution_name: item.institutionName,
+            student: response.data.liabilities.student || [],
+            credit: response.data.liabilities.credit || [],
+            mortgage: response.data.liabilities.mortgage || [],
+          };
+        } catch (err) {
+          // Items without liability accounts (or not yet ready) are expected —
+          // report them as empty rather than failing the whole request.
+          console.warn(
+            `liabilities unavailable for ${item.institutionName}:`,
+            err.response?.data?.error_code || err.message
+          );
+          return { institution_name: item.institutionName, student: [], credit: [], mortgage: [] };
+        }
       })
     );
     res.json({ items: results });
